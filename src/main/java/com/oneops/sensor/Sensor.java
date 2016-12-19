@@ -22,7 +22,6 @@ import com.google.gson.Gson;
 import com.oneops.cms.simple.domain.CmsRfcCISimple;
 import com.oneops.ops.CiOpsProcessor;
 import com.oneops.ops.dao.OpsEventDao;
-import com.oneops.ops.events.CiOpenEvent;
 import com.oneops.ops.events.OpsCloseEvent;
 import com.oneops.ops.events.OpsEvent;
 import com.oneops.sensor.domain.DelayedPerfEvent;
@@ -34,6 +33,8 @@ import com.oneops.sensor.exceptions.SensorException;
 import com.oneops.sensor.thresholds.Threshold;
 import com.oneops.sensor.thresholds.ThresholdsDao;
 import com.oneops.sensor.util.ChannelDownEvent;
+import com.oneops.sensor.util.ReplacedInstances;
+
 import org.apache.log4j.Logger;
 import org.springframework.context.ApplicationContext;
 import org.springframework.context.support.ClassPathXmlApplicationContext;
@@ -84,10 +85,11 @@ public class Sensor {
     private OpsEventDao opsEventDao;
     private StmtBuilder stmtBuilder;
     private CiOpsProcessor coProcessor;
+    private CiStateProcessor ciStateProcessor;
     private Map<String, UpdateListener> listeners;
     private int minHeartbeatSeedDelay = 300;
     private int heartbeatRandomDelay = 30;
-
+    private ReplacedInstances replacedInstances;
 
     /**
      * Sets the statement builder
@@ -348,6 +350,7 @@ public class Sensor {
                 for (String eplName : trStmt.getStmtNames()) {
                     removeStmtFromEngine(manifestId, source, eplName);
                 }
+                ciStateProcessor.updateState4MonitorRemoval(manifestId, source);
                 loadedThresholds.get(manifestId).remove(source);
 
                 persistAndaddToEngine(ciId,
@@ -376,6 +379,7 @@ public class Sensor {
                     for (String eplName : trStmt.getStmtNames()) {
                         removeStmtFromEngine(manifestId, loadedMon, eplName);
                     }
+                    ciStateProcessor.updateState4MonitorRemoval(manifestId, loadedMon);
                     monsToRemove.add(loadedMon);
                     tsDao.removeManifestThreshold(manifestId, loadedMon);
                 }
@@ -455,24 +459,8 @@ public class Sensor {
             oldStmt.removeAllListeners();
             oldStmt.destroy();
         }
-        cleanOpenEvents(manifestId, source);
     }
 
-    private void cleanOpenEvents(long manifestId, String source) {
-        List<Long> ciIds = tsDao.getManifestCiIds(manifestId, 3, 10000, true);
-        Map<Long, List<CiOpenEvent>> openEvents = opsEventDao.getCiOpenEvents(ciIds);
-        for (Map.Entry<Long, List<CiOpenEvent>> entry : openEvents.entrySet()) {
-            long ciId = entry.getKey();
-            for (CiOpenEvent ciOpenEvent : entry.getValue()) {
-                if (ciOpenEvent.getName().startsWith(source + ":")) {
-                    opsEventDao.removeOpenEventForCi(ciId, ciOpenEvent.getName());
-                }
-            }
-        }
-        if (!openEvents.isEmpty()) {
-            coProcessor.resetManifestStates(Arrays.asList(manifestId));
-        }
-    }
 
     /**
      * Removes the ci.
@@ -487,8 +475,9 @@ public class Sensor {
             throw new SensorException("Got Monitor request for the wrong instance - manifestId:" + manifestId + "; pool size:" + this.poolSize + "; my insatnceId:" + this.instanceId);
         }
         logger.info("Removing ciId = " + ciId + " from the manifest map");
+        ciStateProcessor.updateState4CiRemoval(ciId, manifestId);
+        int remainingBoms = coProcessor.removeManifestMap4CiRemoval(ciId, manifestId);
         opsEventDao.removeCi(ciId);
-        int remainingBoms = coProcessor.removeManifestMap(ciId, manifestId);
         if (remainingBoms == 0) {
             //remove thresholds form the engine
             if (loadedThresholds.containsKey(manifestId)) {
@@ -927,6 +916,17 @@ public class Sensor {
     	return (manifestId % poolSize) == instanceId;
     }
 
+    public void handleReplace(long ciId, long manifestId) {
+        if (loadedThresholds.containsKey(manifestId)) {
+            loadedThresholds.get(manifestId).entrySet().stream().
+            	filter(entry -> entry.getValue().isHeartbeat()).
+            	forEach(entry -> {
+                    opsEventDao.removeOpenEventForCi(ciId, entry.getKey());
+                    insertFakeEvent(ciId, manifestId, entry.getKey());
+                    });
+        }
+    }
+
     private class FakeEvent {
         long ciId;
         long manifestId;
@@ -939,5 +939,13 @@ public class Sensor {
 
 	public void setHeartbeatRandomDelay(int heartbeatRandomDelay) {
 		this.heartbeatRandomDelay = heartbeatRandomDelay;
+	}
+
+	public void setCiStateProcessor(CiStateProcessor ciStateProcessor) {
+		this.ciStateProcessor = ciStateProcessor;
+	}
+
+	public void setReplacedInstances(ReplacedInstances replacedInstances) {
+		this.replacedInstances = replacedInstances;
 	}
 }
